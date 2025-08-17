@@ -1,0 +1,54 @@
+- payout - tpv to conv metric 
+
+
+
+with a_conversion as(
+select "from", max(created_at) as last_time from fx_log 
+where "to" = 'USD'
+group by 1), 
+
+conversion_data as(
+select a."from" as from_currency, cast(b.base_rate as decimal(12,10)) as rate_in_usd 
+from a_conversion a 
+join fx_log b on a.last_time = b.created_at and a."from" = b."from"
+),
+
+
+-- payout 
+payout_calc as (
+select payout_id, date(a.created_at) as created_at, 'payout' as object_type, 
+transfer_type as payment_method,
+-- currency
+a.currency as payout_currency, a.holding_currency, c."to" as destination_currency,
+-- amount
+a.amount/100.0 as payout_amount, abs(b.amount)/100.0 as holding_amount, (a.amount/100.0)*c.final_rate as destination_amount
+from (select * from payout 
+where date(created_at) >= date '2025-01-01' and date(created_at) <= date '2025-07-31' and status = 'succeeded') a
+left join balance_transaction b on a.payout_id = b.reference_id
+left join fx_quote c on a.destination_fx_quote_id = c.quote_id
+),
+
+
+
+final as(
+
+select payment_method,
+CASE WHEN payout_currency IN ('USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD', 'DKK', 'SGD', 'HKD') 
+THEN 'major_currency' WHEN payout_currency IN ('SEK', 'NOK', 'MXN', 'BRL', 'INR', 'ZAR', 'TRY', 'IDR', 'THB', 'AED', 'MYR', 'PHP','VND', 'SAR','CNY', 'CNH', 'RMB', 'ILS', 'TWD', 'QAR', 'OMR', 'KWD', 'KRW', 'JOD', 'BHD') THEN 'minor_currency' 
+ WHEN payout_currency = '' or payout_currency is null then 'blank' ELSE 'exotic'
+    END AS currency_categorisation,
+    sum(COALESCE(CAST(payout_amount * COALESCE(c1.rate_in_usd, 1) AS DECIMAL(18,4)), 0)) as tpv_in_usd,
+SUM(
+    COALESCE(CAST(holding_amount * COALESCE(c2.rate_in_usd, 1) AS DECIMAL(18,4)), 0) +
+    COALESCE(CAST(destination_amount * COALESCE(c3.rate_in_usd, 1) AS DECIMAL(18,4)), 0)
+) AS conversion_volume
+
+ FROM payout_calc mi
+        LEFT JOIN conversion_data c1 ON upper(trim(mi.payout_currency)) = upper(trim(c1.from_currency))
+        LEFT JOIN conversion_data c2 ON upper(trim(mi.holding_currency)) = upper(trim(c2.from_currency))
+        LEFT JOIN conversion_data c3 ON upper(trim(mi.destination_currency)) = upper(trim(c3.from_currency))
+
+group by 1,2)
+
+
+select * from final
