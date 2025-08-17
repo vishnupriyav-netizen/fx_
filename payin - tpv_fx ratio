@@ -1,0 +1,88 @@
+
+
+with a_conversion as(
+select "from", max(created_at) as last_time from fx_log 
+where "to" = 'USD'
+group by 1), 
+
+conversion_data as(
+select a."from" as from_currency, cast(b.base_rate as decimal(12,10)) as rate_in_usd 
+from a_conversion a 
+join fx_log b on a.last_time = b.created_at and a."from" = b."from"
+),
+
+
+ all_payins as(
+select a.created_at, a.payin_id,
+substr(a.payin_id, 1,3) as object_type, payment_method_type,
+a.invoice_currency, 
+a.charge_currency, 
+coalesce(q1.holding_currency, q2.holding_currency) as holding_currency,
+c.settlement_currency,
+a.total_paid_amount / 100.0 as invoice_amount, 
+a.total_paid_amount_ccy / 100.0 as charge_amount,
+coalesce(q1.amount / 100.0, q2.amount / 100.0) as holding_amount,
+(COALESCE(q1.amount, q2.amount)/ 100.0) * c.final_rate AS settlement_amount
+from (select 
+b.created_at, a.payin_id, payment_attempt_id, a.invoice_currency, b.charge_currency, b.payment_method_type,
+b.total_paid_amount, b.total_paid_amount_ccy
+from payin a join payment_attempt b  on a.payin_id = b.payin_id
+where date(a.created_at) >= date '2025-01-01' and date(a.created_at) <= date '2025-07-31' and  b.status = 'succeeded') a 
+left join queue q1 on q1.transaction_reference_id = a.payment_attempt_id 
+left join queue q2 on q2.transaction_reference_id = a.payin_id 
+left join (select a.queue_id, b.final_rate, b."to" as settlement_currency
+from settlement_transaction a join fx_quote b on a.fx_quote_id = b.quote_id) c 
+on coalesce(q1.queue_id, q2.queue_id) = c.queue_id
+-- where invoice_currency is not null and charge_currency is not null and settlement_currency is not null
+-- and (q1.holding_currency is not null or  q2.holding_currency is not null)
+),
+
+
+
+
+final as (
+select
+-- case when invoice_currency = charge_currency then 'inv->charge_0' 
+-- when invoice_currency = holding_currency then 'inv->hol_0'
+-- when holding_currency = settlement_currency then 'hol->set_0'
+-- when invoice_currency is not null and charge_currency is not null and invoice_currency <> charge_currency then 'inv->charge_1' 
+-- when invoice_currency is not null and holding_currency is not null and invoice_currency <> holding_currency then 'inv->hol_1'
+-- when holding_currency is not null and settlement_currency is not null and holding_currency <> settlement_currency then 'hol->set_1'
+-- else 'value_not_present' end as fl_converted,
+
+case when  invoice_currency is not null and charge_currency is not null and holding_currency is not null and settlement_currency is not null and
+invoice_currency = charge_currency and invoice_currency = holding_currency and holding_currency = settlement_currency  then 'not_converted'
+when   invoice_currency is not null and charge_currency is not null and holding_currency is not null and settlement_currency is not null and
+invoice_currency = charge_currency or invoice_currency = holding_currency or holding_currency = settlement_currency  then 'converted_atleast_once'
+when  invoice_currency is not null and charge_currency is not null and holding_currency is not null and settlement_currency is not null and
+(invoice_currency <> charge_currency and invoice_currency <> holding_currency and holding_currency <> settlement_currency)  then 'converted_all'
+when  invoice_currency is  null or charge_currency is  null or holding_currency is  null or settlement_currency is  null 
+then 'null_value' else 'unknown' end as fl_converted, 
+
+object_type,
+
+case when lower(payment_method_type) like '%card%' then 'card' 
+when lower(payment_method_type) like '%local%' then 'local_transfer' when lower(payment_method_type) like '%wire%' then 'wire_transfer' 
+when lower(payment_method_type) like '%stablecoin%' then 'stablecoin' else 'apm' end as payment_method,
+CASE WHEN invoice_currency IN ('USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD', 'DKK', 'SGD', 'HKD') 
+THEN 'major_currency' WHEN invoice_currency IN ('SEK', 'NOK', 'MXN', 'BRL', 'INR', 'ZAR', 'TRY', 'IDR', 'THB', 'AED', 'MYR', 'PHP','VND', 'SAR','CNY', 'CNH', 'RMB', 'ILS', 'TWD', 'QAR', 'OMR', 'KWD', 'KRW', 'JOD', 'BHD') THEN 'minor_currency' 
+ WHEN invoice_currency = '' or invoice_currency is null then 'blank' ELSE 'exotic'
+    END AS currency_categorisation,
+    
+    sum(COALESCE(CAST(invoice_amount * COALESCE(c1.rate_in_usd, 1) AS DECIMAL(18,4)), 0)) as tpv_in_usd,
+SUM(
+    COALESCE(CAST(charge_amount * COALESCE(c2.rate_in_usd, 1) AS DECIMAL(18,4)), 0) +
+    COALESCE(CAST(holding_amount * COALESCE(c3.rate_in_usd, 1) AS DECIMAL(18,4)), 0) +
+    COALESCE(CAST(settlement_amount * COALESCE(c4.rate_in_usd, 1) AS DECIMAL(18,4)), 0)
+) AS conversion_volume
+
+ FROM all_payins mi
+        LEFT JOIN conversion_data c1 ON upper(trim(mi.invoice_currency)) = upper(trim(c1.from_currency))
+        LEFT JOIN conversion_data c2 ON upper(trim(mi.charge_currency)) = upper(trim(c2.from_currency))
+        LEFT JOIN conversion_data c3 ON upper(trim(mi.holding_currency)) = upper(trim(c3.from_currency))
+        LEFT JOIN conversion_data c4 ON upper(trim(mi.settlement_currency)) = upper(trim(c4.from_currency))
+
+group by 1,2,3,4)
+
+
+select * from final
