@@ -1,3 +1,5 @@
+-- payout - ratio 
+
 -- payout: holding, payout, destination.
 
 with a_conversion as(
@@ -14,13 +16,12 @@ join fx_log b on a.last_time = b.created_at and a."from" = b."from"
 
 -- payout 
 payout_calc as (
-select payout_id, date(a.created_at) as created_at, 'payout' as object_type, 
-transfer_type as payment_method,
+select payout_id, 
 -- currency
 a.currency as payout_currency, a.holding_currency, c."to" as destination_currency,
 -- amount
 a.amount/100.0 as payout_amount, abs(b.amount)/100.0 as holding_amount, (a.amount/100.0)*c.final_rate as destination_amount
-from (select * from payout where  date(created_at) >= date '2025-01-01' and status = 'succeeded' ) a
+from (select * from payout where  date(created_at) >= date '2025-01-01' and  date(created_at) <= date '2025-07-31' and status = 'succeeded' ) a
 left join balance_transaction b on a.payout_id = b.reference_id
 left join fx_quote c on a.destination_fx_quote_id = c.quote_id
 ),
@@ -31,39 +32,27 @@ all_transactions as (
 
 -- payout 
 select 
-'payout' as object_type, 
 'holding_currency->payout_currency' as conversion_type, 
-CASE WHEN payout_currency IN ('USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD', 'DKK', 'SGD', 'HKD') 
-THEN 'major_currency' WHEN payout_currency IN ('SEK', 'NOK', 'MXN', 'BRL', 'INR', 'ZAR', 'TRY', 'IDR', 'THB', 'AED', 'MYR', 'PHP','VND', 'SAR','CNY', 'CNH', 'RMB', 'ILS', 'TWD', 'QAR', 'OMR', 'KWD', 'KRW', 'JOD', 'BHD') THEN 'minor_currency' 
- WHEN payout_currency = '' or payout_currency is null then 'blank' ELSE 'exotic'
-    END AS currency_categorisation,
-    case when holding_currency = payout_currency then 0 else 1 end as fl_converted,
-    count(distinct case when  holding_currency is not null and payout_currency is not null and destination_currency <> '' and payout_currency <> ''
-    then  payout_id end) as count, 
+case when holding_currency is not null and payout_currency is not null and
+holding_currency = payout_currency then 0 else 1 end as fl_converted,
 sum(cast(payout_amount * COALESCE(rate_in_usd, 1) AS DECIMAL(14, 2))) as tpv_usd
 from payout_calc a 
-join conversion_data cd on a.payout_currency = cd.from_currency
-group by 1,2,3,4
+left join conversion_data cd on a.payout_currency = cd.from_currency
+group by 1,2
 
 union all
 
 select 
-'payout' as object_type, 
 'payout_currency->destination_currency' as conversion_type, 
-CASE WHEN destination_currency IN ('USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', 'NZD', 'DKK', 'SGD', 'HKD') 
-THEN 'major_currency' WHEN destination_currency IN ('SEK', 'NOK', 'MXN', 'BRL', 'INR', 'ZAR', 'TRY', 'IDR', 'THB', 'AED', 'MYR', 'PHP','VND', 'SAR','CNY', 'CNH', 'RMB', 'ILS', 'TWD', 'QAR', 'OMR', 'KWD', 'KRW', 'JOD', 'BHD') THEN 'minor_currency' 
- WHEN destination_currency = '' or destination_currency is null then 'blank' ELSE 'exotic'
-    END AS currency_categorisation,
-    case when  payout_currency = destination_currency then 0 else 1 end as fl_converted,
-    count(distinct case when  destination_currency is not null and payout_currency is not null and destination_currency <> '' and payout_currency <> '' then  payout_id end )  as count, 
+case when destination_currency is not null and payout_currency is not null and
+destination_currency = payout_currency then 0 else 1 end as fl_converted,
 sum(cast(payout_amount * COALESCE(rate_in_usd, 1) AS DECIMAL(14, 2))) as tpv_usd
 from payout_calc a 
-join conversion_data cd on a.payout_currency = cd.from_currency
-group by 1,2,3,4)
+left join conversion_data cd on a.payout_currency = cd.from_currency
+group by 1,2
+
+)
 
 
-SELECT object_type, conversion_type, currency_categorisation, fl_converted,count, tpv_usd
+SELECT conversion_type, fl_converted, tpv_usd
 FROM all_transactions;
-
-
-
