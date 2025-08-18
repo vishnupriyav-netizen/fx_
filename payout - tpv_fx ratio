@@ -1,4 +1,4 @@
-- payout - tpv to conv metric 
+-- payout - tpv to conv metric 
 
 
 
@@ -37,6 +37,7 @@ CASE WHEN payout_currency IN ('USD', 'EUR', 'GBP', 'JPY', 'CHF', 'CAD', 'AUD', '
 THEN 'major_currency' WHEN payout_currency IN ('SEK', 'NOK', 'MXN', 'BRL', 'INR', 'ZAR', 'TRY', 'IDR', 'THB', 'AED', 'MYR', 'PHP','VND', 'SAR','CNY', 'CNH', 'RMB', 'ILS', 'TWD', 'QAR', 'OMR', 'KWD', 'KRW', 'JOD', 'BHD') THEN 'minor_currency' 
  WHEN payout_currency = '' or payout_currency is null then 'blank' ELSE 'exotic'
     END AS currency_categorisation,
+
     sum(COALESCE(CAST(payout_amount * COALESCE(c1.rate_in_usd, 1) AS DECIMAL(18,4)), 0)) as tpv_in_usd,
 SUM(
     COALESCE(CAST(holding_amount * COALESCE(c2.rate_in_usd, 1) AS DECIMAL(18,4)), 0) +
