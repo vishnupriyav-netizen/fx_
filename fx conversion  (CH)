@@ -1,0 +1,279 @@
+-- fx_current_conversion_rate (ClickHouse) - Memory Optimized
+-- Column sources unchanged from original query
+
+WITH
+
+a_conversion AS (
+    SELECT `from`, max(created_at) AS last_time
+    FROM datalake.clean_fx_log
+    WHERE `to` = 'USD'
+    GROUP BY `from`
+),
+
+conversion_data AS (
+    SELECT DISTINCT
+        a.`from`                             AS from_currency,
+        CAST(b.base_rate AS Decimal(12, 10)) AS rate_in_usd
+    FROM a_conversion a
+    JOIN datalake.clean_fx_log b
+        ON a.last_time = b.created_at AND a.`from` = b.`from`
+),
+
+payment_method_categories AS (
+    SELECT
+        payment_attempt_id,
+        CASE
+            WHEN lower(payment_method_type) LIKE '%card%'       THEN 'card'
+            WHEN lower(payment_method_type) LIKE '%local%'      THEN 'local_transfer'
+            WHEN lower(payment_method_type) LIKE '%wire%'       THEN 'wire_transfer'
+            WHEN lower(payment_method_type) LIKE '%stablecoin%' THEN 'stablecoin'
+            ELSE 'apm'
+        END AS payment_method,
+        payment_method_type
+    FROM datalake.clean_payment_attempt
+    WHERE status = 'succeeded'
+      AND toDate(created_at) >= toDate('2026-03-05')   -- scope to date range
+),
+
+-- payin & collects
+-- money_in AS (
+--     SELECT
+--         toDate(a.created_at)              AS created_at,
+--         substring(a.payin_id, 1, 3)       AS object_type,
+--         pm.payment_method,
+--         a.charge_currency,
+--         b.invoice_currency,
+--         c.currency                         AS holding_currency,
+--         (a.total_paid_amount_ccy) / 100.0  AS charge_amount,
+--         (a.total_paid_amount)     / 100.0  AS invoice_amount,
+--         abs(c.amount)             / 100.0  AS holding_amount
+--     FROM datalake.clean_payment_attempt a
+--     JOIN payment_method_categories pm
+--         ON a.payment_attempt_id = pm.payment_attempt_id
+--     LEFT JOIN datalake.clean_payin b
+--         ON a.payin_id = b.payin_id
+--     LEFT JOIN datalake.clean_balance_transaction c
+--         ON a.payin_id = c.reference_id         -- narrow right-side scan
+--     WHERE toDate(a.created_at) >= toDate('2026-03-08') and a.status = 'succeeded' -- direct WHERE
+-- ),
+
+-- payout
+payout_calc AS (
+    SELECT
+        toDate(a.created_at)               AS created_at,
+        'payout'                            AS object_type,
+        transfer_type                       AS payment_method,
+        a.currency                          AS payout_currency,
+        a.holding_currency,
+        c.`to`                              AS destination_currency,
+        a.amount / 100.0                    AS payout_amount,
+        abs(b.amount) / 100.0              AS holding_amount,
+        (a.amount / 100.0) * c.final_rate   AS destination_amount
+    FROM datalake.clean_payout a
+    LEFT JOIN datalake.clean_balance_transaction b
+        ON a.payout_id = b.reference_id
+        -- AND b.transaction_type = 'payout'              -- narrow right-side scan
+    LEFT JOIN datalake.clean_fx_quote c
+        ON a.destination_fx_quote_id = c.quote_id
+    WHERE a.status = 'succeeded'
+      AND toDate(a.created_at) >= toDate('2026-03-08') -- direct WHERE
+),
+
+-- -- refund — column sources unchanged from original
+-- refunds_calc AS (
+--     SELECT
+--         toDate(a.created_at)        AS created_at,
+--         'refund'                     AS object_type,
+--         pm.payment_method,
+--         a.holding_currency as holding_currency,          -- from clean_refund (original source)
+--         c.invoice_currency,          -- from clean_payin via b (original source)
+--         abs(d.amount) / 100.0        AS holding_amount,
+--         a.requested_amount / 100.0   AS invoice_amount
+--     FROM datalake.clean_refund a
+--     LEFT JOIN datalake.clean_payment_attempt b
+--         ON a.payment_attempt_id = b.payment_attempt_id
+--         AND toDate(b.created_at) >= toDate('2026-03-01') -- scope right-side join
+--     LEFT JOIN payment_method_categories pm
+--         ON b.payment_attempt_id = pm.payment_attempt_id
+--     LEFT JOIN datalake.clean_payin c                     -- fixed: was missing datalake prefix
+--         ON b.payin_id = c.payin_id
+--     LEFT JOIN datalake.clean_balance_transaction d
+--         ON b.payin_id = d.reference_id
+--         AND d.transaction_type = 'payin'                 -- narrow right-side scan
+--     WHERE a.status = 'succeeded'
+--       AND toDate(a.created_at) >= toDate('2026-03-01')   -- direct WHERE
+-- ),
+
+-- -- fx_txn, settlement
+-- fxtrxn AS (
+--     SELECT
+--         toDate(a.created_at) AS created_at,
+--         CASE
+--             WHEN type = 'settlement' THEN 'settlement'
+--             ELSE 'other_fx_txn'
+--         END                  AS object_type,
+--         'na'                 AS payment_method,
+--         from_currency,
+--         to_currency,
+--         abs(from_amount) / 100.0 AS from_amount,
+--         abs(to_amount)   / 100.0 AS to_amount
+--     FROM datalake.clean_fx_transaction a
+--     WHERE toDate(a.created_at) >= toDate('2026-03-01')   -- direct WHERE
+-- ),
+
+-- -- adjustments
+-- adj AS (
+--     SELECT
+--         toDate(a.created_at)   AS created_at,
+--         'adjustements'          AS object_type,
+--         'na'                    AS payment_method,
+--         currency_code           AS adjustment_currency,
+--         a.holding_currency,
+--         (a.amount) / 100.0      AS adjustment_amount,
+--         abs(b.amount) / 100.0   AS holding_amount
+--     FROM datalake.clean_adjustment a
+--     LEFT JOIN datalake.clean_balance_transaction b
+--         ON a.adjustment_id = b.reference_id
+--         AND b.transaction_type = 'adjustment'            -- narrow right-side scan
+--     WHERE toDate(a.created_at) >= toDate('2026-03-01')   -- direct WHERE
+-- ),
+
+all_transactions AS (
+
+    -- payin: invoice -> charge currency
+    -- SELECT
+    --     object_type, 'invoice_currency->charge_currency' AS conversion_type,
+    --     created_at, payment_method,
+    --     invoice_currency AS initial_currency, charge_currency AS converted_currency,
+    --     sum(invoice_amount)                  AS initial_amount,
+    --     sum(charge_amount)                   AS converted_amount,
+    --     sum(invoice_amount * cd.rate_in_usd) AS txn_vol_in_usd
+    -- FROM money_in a
+    -- LEFT JOIN conversion_data cd ON a.invoice_currency = cd.from_currency
+    -- GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
+
+    -- UNION ALL
+
+    -- -- payin: invoice -> holding currency
+    -- SELECT
+    --     object_type, 'invoice_currency->holding_currency' AS conversion_type,
+    --     created_at, payment_method,
+    --     invoice_currency AS initial_currency, holding_currency AS converted_currency,
+    --     sum(invoice_amount)                  AS initial_amount,
+    --     sum(holding_amount)                  AS converted_amount,
+    --     sum(invoice_amount * cd.rate_in_usd) AS txn_vol_in_usd
+    -- FROM money_in a
+    -- LEFT JOIN conversion_data cd ON a.invoice_currency = cd.from_currency
+    -- GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
+
+    -- UNION ALL
+
+    -- -- payout: holding -> payout currency
+    SELECT
+        'payout' AS object_type, 'holding_currency->payout_currency' AS conversion_type,
+        created_at, payment_method,
+        holding_currency AS initial_currency, payout_currency AS converted_currency,
+        sum(holding_amount)                  AS initial_amount,
+        sum(payout_amount)                   AS converted_amount,
+        sum(holding_amount * cd.rate_in_usd) AS txn_vol_in_usd
+    FROM payout_calc a
+    JOIN conversion_data cd ON a.holding_currency = cd.from_currency
+    GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
+
+    UNION ALL
+
+    -- payout: payout -> destination currency
+    SELECT
+        'payout' AS object_type, 'payout_currency->destination_currency' AS conversion_type,
+        created_at, payment_method,
+        payout_currency AS initial_currency, destination_currency AS converted_currency,
+        sum(payout_amount)                   AS initial_amount,
+        sum(destination_amount)              AS converted_amount,
+        sum(payout_amount * cd.rate_in_usd)  AS txn_vol_in_usd
+    FROM payout_calc a
+    JOIN conversion_data cd ON a.payout_currency = cd.from_currency
+    GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
+
+    -- UNION ALL
+
+    -- -- refunds: invoice -> holding currency
+    -- SELECT
+    --     'refund' AS object_type, 'invoice_currency->holding_currency' AS conversion_type,
+    --     created_at, payment_method,
+    --     invoice_currency AS initial_currency, holding_currency AS converted_currency,
+    --     sum(invoice_amount)                  AS initial_amount,
+    --     sum(holding_amount)                  AS converted_amount,
+    --     sum(invoice_amount * cd.rate_in_usd) AS txn_vol_in_usd
+    -- FROM refunds_calc a
+    -- JOIN conversion_data cd ON a.invoice_currency = cd.from_currency
+    -- GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
+
+    -- UNION ALL
+
+    -- -- fx transactions
+    -- SELECT
+    --     object_type, 'from_holding_currency->to_holding_currency' AS conversion_type,
+    --     created_at, payment_method,
+    --     from_currency AS initial_currency, to_currency AS converted_currency,
+    --     sum(from_amount)                    AS initial_amount,
+    --     sum(to_amount)                      AS converted_amount,
+    --     sum(from_amount * cd.rate_in_usd)   AS txn_vol_in_usd
+    -- FROM fxtrxn a
+    -- JOIN conversion_data cd ON a.from_currency = cd.from_currency
+    -- GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
+
+    -- UNION ALL
+
+    -- -- adjustments
+    -- SELECT
+    --     object_type, 'adjustment_currency->holding_currency' AS conversion_type,
+    --     created_at, payment_method,
+    --     adjustment_currency AS initial_currency, holding_currency AS converted_currency,
+    --     sum(adjustment_amount)                  AS initial_amount,
+    --     sum(holding_amount)                     AS converted_amount,
+    --     sum(adjustment_amount * cd.rate_in_usd) AS txn_vol_in_usd
+    -- FROM adj a
+    -- JOIN conversion_data cd ON a.adjustment_currency = cd.from_currency
+    -- GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
+
+),
+
+final as (
+
+SELECT
+    object_type,
+    conversion_type,
+    created_at,
+    payment_method,
+    CASE
+        WHEN initial_currency IN ('USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD','DKK','SGD','HKD')
+            THEN 'major_currency'
+        WHEN initial_currency IN ('SEK','NOK','MXN','BRL','INR','ZAR','TRY','IDR','THB','AED','MYR',
+                                   'PHP','VND','SAR','CNY','CNH','RMB','ILS','TWD','QAR','OMR','KWD',
+                                   'KRW','JOD','BHD')
+            THEN 'minor_currency'
+        ELSE 'exotic'
+    END  AS currency_categorisation,
+    initial_currency,
+    converted_currency,
+    CAST(initial_amount   AS Decimal(14, 2))      AS initial_amount,
+    CAST(converted_amount AS Decimal(14, 2))      AS converted_amount,
+    CASE
+        WHEN initial_currency = 'USD' THEN initial_amount
+        ELSE CAST(txn_vol_in_usd AS Decimal(14, 2))
+    END                                           AS txn_volume_in_usd
+FROM all_transactions)
+
+
+select * from final
+
+-- select object_type,
+--     conversion_type,
+--     payment_method,
+--     currency_categorisation,
+--         initial_currency,
+--     converted_currency,
+--     sum(txn_volume_in_usd) 
+    
+--     from final group by 1,2,3,4,5,6 
+    -- where initial_currency != converted_currency
