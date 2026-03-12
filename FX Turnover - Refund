@@ -1,0 +1,232 @@
+WITH
+
+conversion_data AS (
+    SELECT
+        `from`                              AS from_currency,
+        CAST(base_rate AS Decimal(12,10))   AS rate_in_usd,
+        ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
+    FROM datalake.clean_fx_log
+    WHERE `to` = 'USD'
+    QUALIFY row_num = 1
+),
+
+refunds_calc AS (
+    SELECT
+        toDate(a.created_at) AS created_at,
+        a.refund_id,
+
+        CASE
+            WHEN lower(b.payment_method_type) LIKE '%card%'       THEN 'card'
+            WHEN lower(b.payment_method_type) LIKE '%local%'      THEN 'local_transfer'
+            WHEN lower(b.payment_method_type) LIKE '%wire%'       THEN 'wire_transfer'
+            WHEN lower(b.payment_method_type) LIKE '%stablecoin%' THEN 'stablecoin'
+            ELSE 'apm'
+        END AS payment_method,
+
+        a.holding_currency                AS holding_currency,
+        c.invoice_currency                AS invoice_currency,
+
+        -- invoice amount
+        if(lower(c.invoice_currency) = 'btc',
+            a.requested_amount / 100000000.0,
+            a.requested_amount / 100.0)   AS invoice_amount,
+
+        -- holding amount
+        if(lower(a.holding_currency) = 'btc',
+            abs(bt.amount) / 100000000.0,
+            abs(bt.amount) / 100.0)       AS holding_amount
+
+    FROM datalake.clean_refund a
+
+    LEFT JOIN datalake.clean_payment_attempt b
+        ON a.payment_attempt_id = b.payment_attempt_id
+
+    LEFT JOIN datalake.clean_payin c
+        ON b.payin_id = c.payin_id
+
+    -- aggregated balance transaction to avoid duplication
+    LEFT JOIN (
+        SELECT
+            reference_id,
+            amount
+        FROM datalake.clean_balance_transaction
+        WHERE transaction_type = 'refund'
+    ) bt
+        ON a.refund_id = bt.reference_id
+
+    LEFT JOIN datamart.payin dp
+        ON b.payin_id = dp.payin_id
+
+    WHERE a.status = 'succeeded'
+      AND toDate(a.created_at) >= toDate('2026-03-01')
+      AND NOT match(dp.seller_email, '@tazapay\\.com|@digitrade\\.com')
+),
+
+all_transactions AS (
+
+    SELECT
+        'invoice_currency->holding_currency' AS conversion_type,
+        formatDateTime(created_at, '%Y-%b')  AS created_at,
+        payment_method,
+
+        invoice_currency  AS initial_currency,
+        holding_currency  AS converted_currency,
+
+        count(refund_id)          AS number_of_transactions,
+        sum(invoice_amount)   AS initial_amount,
+        sum(holding_amount)   AS converted_amount,
+        sum(invoice_amount * cd.rate_in_usd) AS txn_vol_in_usd
+
+    FROM refunds_calc a
+    LEFT JOIN conversion_data cd
+        ON a.invoice_currency = cd.from_currency
+
+    GROUP BY
+
+        conversion_type,
+        created_at,
+        payment_method,
+        initial_currency,
+        converted_currency
+),
+
+final AS (
+
+SELECT
+    CASE
+        WHEN initial_currency <> converted_currency THEN 'fx_involved'
+        ELSE 'no_fx_involved'
+    END AS is_exchange_involved,
+
+    number_of_transactions,
+
+    conversion_type,
+    created_at,
+    payment_method,
+
+    CASE
+        WHEN initial_currency IN ('USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD','DKK','SGD','HKD')
+            THEN 'major_currency'
+        WHEN initial_currency IN ('SEK','NOK','MXN','BRL','INR','ZAR','TRY','IDR','THB','AED','MYR',
+                                   'PHP','VND','SAR','CNY','CNH','RMB','ILS','TWD','QAR','OMR','KWD',
+                                   'KRW','JOD','BHD')
+            THEN 'minor_currency'
+        ELSE 'exotic'
+    END AS from_currency_categorisation,
+
+    CASE
+        WHEN converted_currency IN ('USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD','DKK','SGD','HKD')
+            THEN 'major_currency'
+        WHEN converted_currency IN ('SEK','NOK','MXN','BRL','INR','ZAR','TRY','IDR','THB','AED','MYR',
+                                   'PHP','VND','SAR','CNY','CNH','RMB','ILS','TWD','QAR','OMR','KWD',
+                                   'KRW','JOD','BHD')
+            THEN 'minor_currency'
+        ELSE 'exotic'
+    END AS to_currency_categorisation,
+
+    initial_currency,
+    converted_currency,
+
+    CAST(initial_amount AS Decimal(14,2))   AS initial_amount,
+    CAST(converted_amount AS Decimal(14,2)) AS converted_amount,
+
+    CASE
+        WHEN initial_currency = 'USD'
+            THEN initial_amount
+        ELSE CAST(txn_vol_in_usd AS Decimal(14,2))
+    END AS txn_volume_in_usd
+
+FROM all_transactions
+)
+
+SELECT *
+FROM final
+
+
+
+
+
+-- WITH conversion_data AS (
+--     SELECT
+--         `from` AS from_currency,
+--         CAST(base_rate AS Decimal(12,10)) AS rate_in_usd,
+--         ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS rn
+--     FROM datalake.clean_fx_log
+--     WHERE `to` = 'USD'
+--     QUALIFY rn = 1
+-- )
+
+-- SELECT
+--     a.refund_id,
+--     a.created_at,
+
+--     CASE
+--         WHEN lower(b.payment_method_type) LIKE '%card%'       THEN 'card'
+--         WHEN lower(b.payment_method_type) LIKE '%local%'      THEN 'local_transfer'
+--         WHEN lower(b.payment_method_type) LIKE '%wire%'       THEN 'wire_transfer'
+--         WHEN lower(b.payment_method_type) LIKE '%stablecoin%' THEN 'stablecoin'
+--         ELSE 'apm'
+--     END AS payment_method,
+
+--     c.invoice_currency,
+--     a.holding_currency,
+
+--     -- amounts used in FX calc
+--     if(lower(c.invoice_currency) = 'btc',
+--         a.requested_amount / 100000000.0,
+--         a.requested_amount / 100.0) AS invoice_amount,
+
+--     if(lower(a.holding_currency) = 'btc',
+--         abs(bt.amount) / 100000000.0,
+--         abs(bt.amount) / 100.0) AS holding_amount,
+
+--     cd.rate_in_usd AS fx_rate_to_usd,
+
+--     -- USD volume calculation
+--     if(c.invoice_currency = 'USD',
+--         if(lower(c.invoice_currency) = 'btc',
+--             a.requested_amount / 100000000.0,
+--             a.requested_amount / 100.0),
+--         (if(lower(c.invoice_currency) = 'btc',
+--             a.requested_amount / 100000000.0,
+--             a.requested_amount / 100.0) * cd.rate_in_usd)
+--     ) AS txn_volume_in_usd
+
+-- FROM datalake.clean_refund a
+
+-- LEFT JOIN datalake.clean_payment_attempt b
+--     ON a.payment_attempt_id = b.payment_attempt_id
+
+-- LEFT JOIN datalake.clean_payin c
+--     ON b.payin_id = c.payin_id
+
+-- LEFT JOIN (
+--     SELECT
+--         reference_id,
+--         amount
+--     FROM datalake.clean_balance_transaction
+--     WHERE transaction_type = 'refund'
+-- ) bt
+--     ON a.refund_id = bt.reference_id
+
+-- LEFT JOIN conversion_data cd
+--     ON c.invoice_currency = cd.from_currency
+
+-- WHERE a.status = 'succeeded'
+
+-- AND a.created_at >= '2026-03-01'
+-- AND a.created_at <  '2026-04-01'
+
+-- AND c.invoice_currency = 'USD'
+-- AND a.holding_currency = 'USD'
+
+-- AND (
+--     CASE
+--         WHEN lower(b.payment_method_type) LIKE '%card%'       THEN 'card'
+--         WHEN lower(b.payment_method_type) LIKE '%local%'      THEN 'local_transfer'
+--         WHEN lower(b.payment_method_type) LIKE '%wire%'       THEN 'wire_transfer'
+--         WHEN lower(b.payment_method_type) LIKE '%stablecoin%' THEN 'stablecoin'
+--         ELSE 'apm'
+--     END
+-- ) = 'apm'
+-- ;
