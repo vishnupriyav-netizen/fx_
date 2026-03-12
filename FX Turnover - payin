@@ -1,0 +1,161 @@
+
+-- (A) Frequent sanity check required for following conditions:
+-- 1. payment_method_type categotisation
+-- 2. timestamp filter -  toDate(created_at) >= toDate('2025-11-01')
+-- 3. currency categorisation (major/minor/exotic)
+
+
+-- (B) sanity check done based on partnership dashboard
+
+
+-- (C) FX involved - invoice -> charge, invoice -> holding 
+
+
+WITH
+
+conversion_data AS (
+    SELECT
+        `from`                              AS from_currency,
+        created_at                          AS last_time,
+        CAST(base_rate AS Decimal(12, 10))  AS rate_in_usd,
+        ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
+    FROM datalake.clean_fx_log
+    WHERE `to` = 'USD'
+    QUALIFY row_num = 1
+),
+
+-- payin & collects
+money_in AS (
+    SELECT
+        toDate(a.created_at)  AS created_at,
+        a.payin_id,
+        CASE
+            WHEN substring(a.payin_id, 1, 3) = 'col' THEN 'collect'
+            ELSE 'payin'
+        END AS object_type,
+
+        -- inlined from payment_method_categories CTE (eliminates extra scan + JOIN)
+        CASE
+            WHEN lower(a.payment_method_type) LIKE '%card%'       THEN 'card'
+            WHEN lower(a.payment_method_type) LIKE '%local%'      THEN 'local_transfer'
+            WHEN lower(a.payment_method_type) LIKE '%wire%'       THEN 'wire_transfer'
+            WHEN lower(a.payment_method_type) LIKE '%stablecoin%' THEN 'stablecoin'
+            ELSE 'apm'
+        END AS payment_method,
+
+        a.charge_currency as charge_currency,
+        b.invoice_currency as invoice_currency,
+        c.currency AS holding_currency,
+
+        -- Charge Amount
+        if(lower(a.charge_currency) = 'btc',
+            a.total_paid_amount_ccy / 100000000.0,
+            a.total_paid_amount_ccy / 100.0)  AS charge_amount,
+
+        -- Invoice Amount
+        if(lower(b.invoice_currency) = 'btc',
+            a.total_paid_amount / 100000000.0,
+            a.total_paid_amount / 100.0)       AS invoice_amount,
+
+        -- Holding Amount (abs on LEFT JOIN NULL is intentional → treats missing as 0)
+        if(lower(c.currency) = 'btc',
+            abs(c.amount) / 100000000.0,
+            abs(c.amount) / 100.0)             AS holding_amount
+
+    FROM datalake.clean_payment_attempt a
+
+    LEFT JOIN datalake.clean_payin b
+        ON a.payin_id = b.payin_id
+
+    -- Narrowed right-side scan: only credits whose reference_id is in scope
+    LEFT JOIN (
+        SELECT reference_id, currency, amount
+        FROM datalake.clean_balance_transaction
+        WHERE impact_type = 'credit'
+          AND reference_id IN (
+              SELECT payin_id
+              FROM datalake.clean_payment_attempt
+              WHERE toDate(created_at) >= toDate('2025-11-01')
+                AND status = 'succeeded'
+          )
+    ) c ON a.payin_id = c.reference_id
+
+    -- Seller email filter (column only exists in datamart.payin)
+    LEFT JOIN datamart.payin dp
+        ON a.payin_id = dp.payin_id
+
+    WHERE toDate(a.created_at) >= toDate('2025-11-01')
+      AND a.status = 'succeeded'
+      AND NOT match(dp.seller_email, '@tazapay\\.com|@digitrade\\.com')
+),
+
+all_transactions AS (
+
+    -- payin: invoice -> charge currency
+    SELECT
+        object_type,
+        'invoice_currency->charge_currency'                  AS conversion_type,
+        formatDateTime(created_at, '%Y-%b')                  AS created_at,  -- toDate() removed: already cast in money_in
+        payment_method,
+        invoice_currency                                     AS initial_currency,
+        charge_currency                                      AS converted_currency,
+        count(*)                                             AS number_of_transactions,  -- count(*) avoids null check
+        sum(invoice_amount)                                  AS initial_amount,
+        sum(charge_amount)                                   AS converted_amount,
+        sum(invoice_amount * cd.rate_in_usd)                 AS txn_vol_in_usd
+    FROM money_in a
+    LEFT JOIN conversion_data cd ON a.invoice_currency = cd.from_currency
+    GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
+
+    UNION ALL
+
+    -- payin: invoice -> holding currency
+    SELECT
+        object_type,
+        'invoice_currency->holding_currency'                 AS conversion_type,
+        formatDateTime(created_at, '%Y-%b')                  AS created_at,
+        payment_method,
+        invoice_currency                                     AS initial_currency,
+        holding_currency                                     AS converted_currency,
+        count(*)                                             AS number_of_transactions,
+        sum(invoice_amount)                                  AS initial_amount,
+        sum(holding_amount)                                  AS converted_amount,
+        sum(invoice_amount * cd.rate_in_usd)                 AS txn_vol_in_usd
+    FROM money_in a
+    LEFT JOIN conversion_data cd ON a.invoice_currency = cd.from_currency
+    GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
+),
+
+final AS (
+    SELECT
+        CASE
+            WHEN initial_currency <> converted_currency THEN 'fx_involved'
+            ELSE 'no_fx_involved'
+        END                                               AS is_exchange_involved,
+        number_of_transactions,
+        object_type,
+        conversion_type,
+        created_at,
+        payment_method,
+        CASE
+            WHEN initial_currency IN ('USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD','DKK','SGD','HKD')
+                THEN 'major_currency'
+            WHEN initial_currency IN ('SEK','NOK','MXN','BRL','INR','ZAR','TRY','IDR','THB','AED','MYR',
+                                       'PHP','VND','SAR','CNY','CNH','RMB','ILS','TWD','QAR','OMR','KWD',
+                                       'KRW','JOD','BHD')
+                THEN 'minor_currency'
+            ELSE 'exotic'
+        END                                               AS currency_categorisation,
+        initial_currency,
+        converted_currency,
+        CAST(initial_amount   AS Decimal(14, 2))          AS initial_amount,
+        CAST(converted_amount AS Decimal(14, 2))          AS converted_amount,
+        CASE
+            WHEN initial_currency = 'USD' THEN initial_amount
+            ELSE CAST(txn_vol_in_usd AS Decimal(14, 2))
+        END                                               AS txn_volume_in_usd
+    FROM all_transactions
+)
+
+SELECT * FROM final
+SETTINGS max_threads = 4, join_algorithm = 'full_sorting_merge'  -- moved to query level (was incorrectly inside CTE)
