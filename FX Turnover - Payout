@@ -1,0 +1,234 @@
+-- FX Turnover - Payout
+-- Fixes applied:
+--   1. seller_filter CTE added first (cross-schema isolation pattern for Superset dataset saving)
+--   2. Fixed syntax error: missing closing ) on if() for destination_amount
+--   3. Renamed second computed column to destination_amount (was duplicate holding_amount)
+--   4. Fixed subquery alias bug: removed a. prefix inside FROM subquery
+--   5. Fixed b.holding_currency -> b.currency (correct column name in clean_balance_transaction)
+--   6. Removed object_type from GROUP BY and SELECT (not defined for payout, no equivalent of payin/collect split)
+--   7. SETTINGS removed from query (incompatible with Superset dataset saving — use at DB/user profile level)
+
+WITH
+
+-- Cross-schema filter isolated as first CTE (required for Superset dataset saving)
+seller_filter AS (
+    SELECT payout_id
+    FROM datamart.datamart_payout
+    WHERE NOT match(seller_email, '@tazapay\\.com|@digitrade\\.com')
+),
+
+conversion_data AS (
+    SELECT
+        `from`                              AS from_currency,
+        created_at                          AS last_time,
+        CAST(base_rate AS Decimal(12, 10))  AS rate_in_usd,
+        ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
+    FROM datalake.clean_fx_log
+    WHERE `to` = 'USD'
+    QUALIFY row_num = 1
+),
+
+payout_calc AS (
+    SELECT
+        toDate(a.created_at)        AS created_at,
+        a.transfer_type             AS payment_method,
+        a.currency                  AS payout_currency,
+        a.holding_currency,
+        c.`to`                      AS destination_currency,
+
+        -- Payout amount (in payout currency)
+        if(lower(a.currency) = 'btc',
+            a.amount / 100000000.0,
+            a.amount / 100.0)       AS payout_amount,
+
+        -- Holding amount from balance transaction debit
+        -- abs on LEFT JOIN NULL is intentional → treats missing as 0
+        if(lower(b.currency) = 'btc',
+            abs(b.amount) / 100000000.0,
+            abs(b.amount) / 100.0)  AS holding_amount,
+
+        -- Destination amount derived from FX quote
+        if(lower(c.`to`) = 'btc',
+            ((a.amount / 100.0) * c.final_rate) / 100000000.0,
+            (a.amount / 100.0) * c.final_rate)  AS destination_amount
+
+    FROM datalake.clean_payout a
+
+    -- Seller email filter (early row reduction via INNER JOIN)
+    INNER JOIN seller_filter sf ON a.payout_id = sf.payout_id
+
+    LEFT JOIN datalake.clean_balance_transaction b
+        ON a.payout_id = b.reference_id
+
+    LEFT JOIN datalake.clean_fx_quote c
+        ON a.destination_fx_quote_id = c.quote_id
+
+    WHERE a.status = 'succeeded'
+      AND toDate(a.created_at) >= toDate('2025-11-01')
+      
+    SETTINGS max_threads = 4, join_algorithm = 'full_sorting_merge'
+),
+
+all_transactions AS (
+
+    -- payout: holding -> payout currency
+    SELECT
+        'holding_currency->payout_currency'  AS conversion_type,
+         formatDateTime(created_at, '%Y-%b')                  AS created_at,
+        payment_method,
+        holding_currency  AS initial_currency,
+        payout_currency                      AS converted_currency,
+        count(*)                             AS number_of_transactions,
+        sum(holding_amount)                  AS initial_amount,
+        sum(payout_amount)                   AS converted_amount,
+        sum(holding_amount * cd.rate_in_usd) AS txn_vol_in_usd
+    FROM payout_calc a
+    LEFT JOIN conversion_data cd ON a.holding_currency = cd.from_currency
+    GROUP BY conversion_type, created_at, payment_method, initial_currency, converted_currency
+
+    UNION ALL
+
+    -- payout: payout -> destination currency
+    SELECT
+        'payout_currency->destination_currency' AS conversion_type,
+        formatDateTime(created_at, '%Y-%b')                  AS created_at,
+        payment_method,
+        payout_currency                         AS initial_currency,
+        destination_currency                    AS converted_currency,
+        count(*)                                AS number_of_transactions,
+        sum(payout_amount)                      AS initial_amount,
+        sum(destination_amount)                 AS converted_amount,
+        sum(payout_amount * cd.rate_in_usd)     AS txn_vol_in_usd
+    FROM payout_calc a
+    LEFT JOIN conversion_data cd ON a.payout_currency = cd.from_currency
+    GROUP BY conversion_type, created_at, payment_method, initial_currency, converted_currency
+),
+
+final AS (
+    SELECT
+        CASE
+            WHEN initial_currency <> converted_currency THEN 'fx_involved'
+            ELSE 'no_fx_involved'
+        END                                               AS is_exchange_involved,
+        number_of_transactions,
+        conversion_type,
+        created_at,
+        payment_method,
+        CASE
+            WHEN initial_currency IN ('USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD','DKK','SGD','HKD')
+                THEN 'major_currency'
+            WHEN initial_currency IN ('SEK','NOK','MXN','BRL','INR','ZAR','TRY','IDR','THB','AED','MYR',
+                                       'PHP','VND','SAR','CNY','CNH','RMB','ILS','TWD','QAR','OMR','KWD',
+                                       'KRW','JOD','BHD')
+                THEN 'minor_currency'
+            ELSE 'exotic'
+        END                                               AS from_currency_categorisation,
+                CASE
+            WHEN converted_currency IN ('USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD','DKK','SGD','HKD')
+                THEN 'major_currency'
+            WHEN converted_currency IN ('SEK','NOK','MXN','BRL','INR','ZAR','TRY','IDR','THB','AED','MYR',
+                                       'PHP','VND','SAR','CNY','CNH','RMB','ILS','TWD','QAR','OMR','KWD',
+                                       'KRW','JOD','BHD')
+                THEN 'minor_currency'
+            ELSE 'exotic'
+        END                                               AS to_currency_categorisation,
+        initial_currency,
+        converted_currency,
+        CAST(initial_amount   AS Decimal(38, 8))          AS initial_amount,
+        CAST(converted_amount AS Decimal(38, 8))          AS converted_amount,
+        CASE
+            WHEN initial_currency = 'USD' THEN initial_amount
+            ELSE CAST(txn_vol_in_usd AS Decimal(38, 8))
+        END                                               AS txn_volume_in_usd
+    FROM all_transactions
+)
+
+SELECT * FROM final
+
+
+
+
+
+
+
+
+
+-- Raw payout drill-down
+-- Filters: conversion_type = payout->destination | date = 2026-03-08
+--          payment_method = local | payout_currency = BTC | destination_currency = PHP
+
+-- SELECT
+--     -- Payout core
+--     a.payout_id,
+--     a.account_id,
+--     dp.seller_email,
+--     dp.business_name,
+--     toDate(a.created_at)                                        AS created_at,
+--     a.transfer_type                                             AS payment_method,
+--     a.status                                                    AS payout_status,
+
+--     -- Payout currency & amount (BTC)
+--     a.currency                                                  AS payout_currency,
+--     if(lower(a.currency) = 'btc',
+--         a.amount / 100000000.0,
+--         a.amount / 100.0)                                       AS payout_amount,
+
+--     -- Destination currency & amount (PHP via FX quote)
+--     c.`to`                                                      AS destination_currency,
+--     if(lower(c.`to`) = 'btc',
+--         ((a.amount / 100.0) * c.final_rate) / 100000000.0,
+--         (a.amount / 100.0) * c.final_rate)                      AS destination_amount,
+      
+      
+--             a.holding_currency,
+        
+        
+--             if(lower(b.currency) = 'btc',
+--             abs(b.amount) / 100000000.0,
+--             abs(b.amount) / 100.0)  AS holding_amount,
+
+--     -- FX quote details
+--     a.destination_fx_quote_id,
+--     c.`from`                                                    AS fx_from,
+--     c.`to`                                                      AS fx_to,
+--     c.base_rate                                                 AS fx_base_rate,
+--     c.final_rate                                                AS fx_final_rate,
+
+--     -- Holding currency
+--     a.holding_currency,
+
+--     -- Balance transaction (debit from holding)
+--     b.balance_transaction_id,
+--     b.impact_type,
+--     b.currency                                                  AS balance_currency,
+--     if(lower(b.currency) = 'btc',
+--         abs(b.amount) / 100000000.0,
+--         abs(b.amount) / 100.0)                                  AS holding_amount_debited
+
+-- FROM datalake.clean_payout a
+
+-- -- Seller email filter
+-- INNER JOIN datamart.datamart_payout dp
+--     ON a.payout_id = dp.payout_id
+--     AND NOT match(dp.seller_email, '@tazapay\\.com|@digitrade\\.com')
+
+-- -- Balance transaction (holding debit)
+-- LEFT JOIN datalake.clean_balance_transaction b
+--     ON a.payout_id = b.reference_id
+--     AND b.impact_type = 'debit'
+
+-- -- FX quote for destination conversion
+-- LEFT JOIN datalake.clean_fx_quote c
+--     ON a.destination_fx_quote_id = c.quote_id
+
+-- WHERE toDate(a.created_at) >= toDate('2026-03-01')
+--   AND a.status = 'succeeded'
+--   AND lower(a.transfer_type) = 'swift'     -- payment_method = local
+--   -- payout 
+--   AND lower(a.currency) = 'aed'                 -- initial_currency = BTC
+--   -- -- destinatin
+--   -- AND lower(c.`to`) = 'aed'    
+--   and a.holding_currency = 'AED' -- converted_currency = PHP
+
+-- ORDER BY a.created_at
+-- -- SETTINGS join_algorithm = 'full_sorting_merge'
