@@ -1,0 +1,126 @@
+WITH
+
+conversion_data AS (
+    SELECT
+        `from`                            AS from_currency,
+        CAST(base_rate AS Decimal(12,10)) AS rate_in_usd,
+        ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
+    FROM datalake.clean_fx_log
+    WHERE `to` = 'USD'
+    QUALIFY row_num = 1
+),
+
+adj AS (
+    SELECT
+        a.created_at,
+        'adjustments' AS object_type,
+        'na' AS payment_method,
+
+        currency_code AS adjustment_currency,
+        a.holding_currency,
+
+        if(lower(currency_code) = 'btc',
+            a.amount / 100000000.0,
+            a.amount / 100.0) AS adjustment_amount,
+
+        if(lower(a.holding_currency) = 'btc',
+            abs(bt.amount) / 100000000.0,
+            abs(bt.amount) / 100.0) AS holding_amount
+
+    FROM datalake.clean_adjustment a
+
+    LEFT JOIN (
+        SELECT
+            reference_id,
+            sum(amount) AS amount
+        FROM datalake.clean_balance_transaction
+        WHERE transaction_type = 'adjustment'
+        GROUP BY reference_id
+    ) bt
+        ON a.adjustment_id = bt.reference_id
+
+    WHERE a.created_at >= '2026-03-01'
+),
+
+all_transactions AS (
+
+    SELECT
+        object_type,
+        'adjustment_currency->holding_currency' AS conversion_type,
+        formatDateTime(created_at, '%Y-%b') AS created_at,
+        payment_method,
+
+        adjustment_currency AS initial_currency,
+        holding_currency AS converted_currency,
+
+        count(*) AS number_of_transactions,
+
+        sum(adjustment_amount) AS initial_amount,
+        sum(holding_amount) AS converted_amount,
+
+        sum(adjustment_amount * cd.rate_in_usd) AS txn_vol_in_usd
+
+    FROM adj a
+    LEFT JOIN conversion_data cd
+        ON a.adjustment_currency = cd.from_currency
+
+    GROUP BY
+        object_type,
+        conversion_type,
+        created_at,
+        payment_method,
+        initial_currency,
+        converted_currency
+),
+
+final AS (
+
+SELECT
+    CASE
+        WHEN initial_currency <> converted_currency THEN 'fx_involved'
+        ELSE 'no_fx_involved'
+    END AS is_exchange_involved,
+
+    number_of_transactions,
+    object_type,
+    conversion_type,
+    created_at,
+    payment_method,
+
+    CASE
+        WHEN initial_currency IN ('USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD','DKK','SGD','HKD')
+            THEN 'major_currency'
+        WHEN initial_currency IN ('SEK','NOK','MXN','BRL','INR','ZAR','TRY','IDR','THB','AED','MYR',
+                                  'PHP','VND','SAR','CNY','CNH','RMB','ILS','TWD','QAR','OMR','KWD',
+                                  'KRW','JOD','BHD')
+            THEN 'minor_currency'
+        ELSE 'exotic'
+    END AS from_currency_categorisation,
+
+    CASE
+        WHEN converted_currency IN ('USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD','DKK','SGD','HKD')
+            THEN 'major_currency'
+        WHEN converted_currency IN ('SEK','NOK','MXN','BRL','INR','ZAR','TRY','IDR','THB','AED','MYR',
+                                  'PHP','VND','SAR','CNY','CNH','RMB','ILS','TWD','QAR','OMR','KWD',
+                                  'KRW','JOD','BHD')
+            THEN 'minor_currency'
+        ELSE 'exotic'
+    END AS to_currency_categorisation,
+
+    initial_currency,
+    converted_currency,
+
+    CAST(initial_amount AS Decimal(14,2))   AS initial_amount,
+    CAST(converted_amount AS Decimal(14,2)) AS converted_amount,
+
+    CASE
+        WHEN initial_currency = 'USD'
+            THEN initial_amount
+        ELSE CAST(txn_vol_in_usd AS Decimal(14,2))
+    END AS txn_volume_in_usd
+
+FROM all_transactions
+)
+
+SELECT *
+FROM final
