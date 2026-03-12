@@ -1,0 +1,138 @@
+WITH
+
+conversion_data AS (
+    SELECT
+        `from`                              AS from_currency,
+        CAST(base_rate AS Decimal(12,10))   AS rate_in_usd,
+        ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
+    FROM datalake.clean_fx_log
+    WHERE `to` = 'USD'
+    QUALIFY row_num = 1
+),
+
+fxtrxn AS (
+    SELECT
+        a.created_at,
+        CASE
+            WHEN type = 'settlement' THEN 'settlement'
+            ELSE 'other_fx_txn'
+        END AS object_type,
+
+        from_currency,
+        to_currency,
+
+        if(lower(from_currency) = 'btc',
+            abs(from_amount) / 100000000.0,
+            abs(from_amount) / 100.0) AS from_amount,
+
+        if(lower(to_currency) = 'btc',
+            abs(to_amount) / 100000000.0,
+            abs(to_amount) / 100.0) AS to_amount
+
+    FROM datalake.clean_fx_transaction a
+    WHERE a.created_at >= '2026-03-01'
+),
+
+all_transactions AS (
+
+    SELECT
+        object_type,
+        'from_holding_currency->to_holding_currency' AS conversion_type,
+        formatDateTime(created_at, '%Y-%b') AS created_at,
+
+        from_currency AS initial_currency,
+        to_currency   AS converted_currency,
+
+        count(*)      AS number_of_transactions,
+
+        sum(from_amount) AS initial_amount,
+        sum(to_amount)   AS converted_amount,
+
+        sum(from_amount * cd.rate_in_usd) AS txn_vol_in_usd
+
+    FROM fxtrxn a
+    LEFT JOIN conversion_data cd
+        ON a.from_currency = cd.from_currency
+
+    GROUP BY
+        object_type,
+        conversion_type,
+        created_at,
+        initial_currency,
+        converted_currency
+),
+
+final AS (
+
+SELECT
+
+    CASE
+        WHEN initial_currency <> converted_currency THEN 'fx_involved'
+        ELSE 'no_fx_involved'
+    END AS is_exchange_involved,
+
+    number_of_transactions,
+    object_type,
+    conversion_type,
+    created_at,
+
+    CASE
+        WHEN initial_currency IN ('USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD','DKK','SGD','HKD')
+            THEN 'major_currency'
+        WHEN initial_currency IN ('SEK','NOK','MXN','BRL','INR','ZAR','TRY','IDR','THB','AED','MYR',
+                                   'PHP','VND','SAR','CNY','CNH','RMB','ILS','TWD','QAR','OMR','KWD',
+                                   'KRW','JOD','BHD')
+            THEN 'minor_currency'
+        ELSE 'exotic'
+    END AS from_currency_categorisation,
+
+    CASE
+        WHEN converted_currency IN ('USD','EUR','GBP','JPY','CHF','CAD','AUD','NZD','DKK','SGD','HKD')
+            THEN 'major_currency'
+        WHEN converted_currency IN ('SEK','NOK','MXN','BRL','INR','ZAR','TRY','IDR','THB','AED','MYR',
+                                   'PHP','VND','SAR','CNY','CNH','RMB','ILS','TWD','QAR','OMR','KWD',
+                                   'KRW','JOD','BHD')
+            THEN 'minor_currency'
+        ELSE 'exotic'
+    END AS to_currency_categorisation,
+
+    initial_currency,
+    converted_currency,
+
+    CAST(initial_amount AS Decimal(14,2))   AS initial_amount,
+    CAST(converted_amount AS Decimal(14,2)) AS converted_amount,
+
+    CASE
+        WHEN initial_currency = 'USD'
+            THEN initial_amount
+        ELSE CAST(txn_vol_in_usd AS Decimal(14,2))
+    END AS txn_volume_in_usd
+
+FROM all_transactions
+)
+
+SELECT *
+FROM final
+
+
+
+
+
+-- SELECT
+--     fx_transaction_id,
+--     created_at,
+--     type,
+--     from_currency,
+--     to_currency,
+--     abs(from_amount) / 100.0 AS from_amount,
+--     abs(to_amount) / 100.0   AS to_amount
+-- FROM datalake.clean_fx_transaction
+-- WHERE created_at >= '2026-03-01'
+--   AND created_at <  '2026-04-01'
+
+--   -- object_type = other_fx_txn
+--   AND type = 'recovery'
+
+--   -- currency pair
+--   -- AND from_currency = 'PLN'
+--   -- AND to_currency   = 'USD'
