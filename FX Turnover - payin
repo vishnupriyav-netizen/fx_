@@ -1,4 +1,6 @@
 
+-- 1. check - payin
+
 -- (A) Frequent sanity check required for following conditions:
 -- 1. payment_method_type categotisation
 -- 2. timestamp filter -  toDate(created_at) >= toDate('2025-11-01')
@@ -11,21 +13,21 @@
 -- (C) FX involved - invoice -> charge, invoice -> holding 
 
 
-WITH
+-- WITH
 
-conversion_data AS (
-    SELECT
-        `from`                              AS from_currency,
-        created_at                          AS last_time,
-        CAST(base_rate AS Decimal(12, 10))  AS rate_in_usd,
-        ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
-    FROM datalake.clean_fx_log
-    WHERE `to` = 'USD'
-    QUALIFY row_num = 1
-),
+-- conversion_data AS (
+--     SELECT
+--         `from`                              AS from_currency,
+--         created_at                          AS last_time,
+--         CAST(base_rate AS Decimal(12, 10))  AS rate_in_usd,
+--         ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
+--     FROM datalake.clean_fx_log
+--     WHERE `to` = 'USD'
+--     QUALIFY row_num = 1
+-- ),
 
 -- payin & collects
-money_in AS (
+with money_in AS (
     SELECT
         toDate(a.created_at)  AS created_at,
         a.payin_id,
@@ -102,9 +104,9 @@ all_transactions AS (
         count(*)                                             AS number_of_transactions,  -- count(*) avoids null check
         sum(invoice_amount)                                  AS initial_amount,
         sum(charge_amount)                                   AS converted_amount,
-        sum(invoice_amount * cd.rate_in_usd)                 AS txn_vol_in_usd
+        sum(invoice_amount)                 AS txn_vol_in_usd
     FROM money_in a
-    LEFT JOIN conversion_data cd ON a.invoice_currency = cd.from_currency
+    -- LEFT JOIN conversion_data cd ON a.invoice_currency = cd.from_currency
     GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
 
     UNION ALL
@@ -120,9 +122,9 @@ all_transactions AS (
         count(*)                                             AS number_of_transactions,
         sum(invoice_amount)                                  AS initial_amount,
         sum(holding_amount)                                  AS converted_amount,
-        sum(invoice_amount * cd.rate_in_usd)                 AS txn_vol_in_usd
+        sum(invoice_amount)                 AS txn_vol_in_usd
     FROM money_in a
-    LEFT JOIN conversion_data cd ON a.invoice_currency = cd.from_currency
+    -- LEFT JOIN conversion_data cd ON a.invoice_currency = cd.from_currency
     GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
 ),
 
