@@ -1,16 +1,18 @@
-WITH
+-- check 3 - refund 
 
-conversion_data AS (
-    SELECT
-        `from`                              AS from_currency,
-        CAST(base_rate AS Decimal(12,10))   AS rate_in_usd,
-        ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
-    FROM datalake.clean_fx_log
-    WHERE `to` = 'USD'
-    QUALIFY row_num = 1
-),
+-- WITH
 
-refunds_calc AS (
+-- conversion_data AS (
+--     SELECT
+--         `from`                              AS from_currency,
+--         CAST(base_rate AS Decimal(12,10))   AS rate_in_usd,
+--         ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
+--     FROM datalake.clean_fx_log
+--     WHERE `to` = 'USD'
+--     QUALIFY row_num = 1
+-- ),
+
+with refunds_calc AS (
     SELECT
         toDate(a.created_at) AS created_at,
         a.refund_id,
@@ -58,7 +60,7 @@ refunds_calc AS (
         ON b.payin_id = dp.payin_id
 
     WHERE a.status = 'succeeded'
-      AND toDate(a.created_at) >= toDate('2026-03-01')
+      AND toDate(a.created_at) >= toDate('2025-11-01')
       AND NOT match(dp.seller_email, '@tazapay\\.com|@digitrade\\.com')
 ),
 
@@ -75,11 +77,11 @@ all_transactions AS (
         count(refund_id)          AS number_of_transactions,
         sum(invoice_amount)   AS initial_amount,
         sum(holding_amount)   AS converted_amount,
-        sum(invoice_amount * cd.rate_in_usd) AS txn_vol_in_usd
+        sum(invoice_amount ) AS txn_vol_in_usd
 
     FROM refunds_calc a
-    LEFT JOIN conversion_data cd
-        ON a.invoice_currency = cd.from_currency
+    -- LEFT JOIN conversion_data cd
+    --     ON a.invoice_currency = cd.from_currency
 
     GROUP BY
 
