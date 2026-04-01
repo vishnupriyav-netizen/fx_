@@ -1,3 +1,5 @@
+-- 2. check - payout 
+
 -- FX Turnover - Payout
 -- Fixes applied:
 --   1. seller_filter CTE added first (cross-schema isolation pattern for Superset dataset saving)
@@ -17,16 +19,16 @@ seller_filter AS (
     WHERE NOT match(seller_email, '@tazapay\\.com|@digitrade\\.com')
 ),
 
-conversion_data AS (
-    SELECT
-        `from`                              AS from_currency,
-        created_at                          AS last_time,
-        CAST(base_rate AS Decimal(12, 10))  AS rate_in_usd,
-        ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
-    FROM datalake.clean_fx_log
-    WHERE `to` = 'USD'
-    QUALIFY row_num = 1
-),
+-- conversion_data AS (
+--     SELECT
+--         `from`                              AS from_currency,
+--         created_at                          AS last_time,
+--         CAST(base_rate AS Decimal(12, 10))  AS rate_in_usd,
+--         ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
+--     FROM datalake.clean_fx_log
+--     WHERE `to` = 'USD'
+--     QUALIFY row_num = 1
+-- ),
 
 payout_calc AS (
     SELECT
@@ -81,9 +83,9 @@ all_transactions AS (
         count(*)                             AS number_of_transactions,
         sum(holding_amount)                  AS initial_amount,
         sum(payout_amount)                   AS converted_amount,
-        sum(holding_amount * cd.rate_in_usd) AS txn_vol_in_usd
+        sum(holding_amount) AS txn_vol_in_usd
     FROM payout_calc a
-    LEFT JOIN conversion_data cd ON a.holding_currency = cd.from_currency
+    -- LEFT JOIN conversion_data cd ON a.holding_currency = cd.from_currency
     GROUP BY conversion_type, created_at, payment_method, initial_currency, converted_currency
 
     UNION ALL
@@ -98,9 +100,9 @@ all_transactions AS (
         count(*)                                AS number_of_transactions,
         sum(payout_amount)                      AS initial_amount,
         sum(destination_amount)                 AS converted_amount,
-        sum(payout_amount * cd.rate_in_usd)     AS txn_vol_in_usd
+        sum(payout_amount)     AS txn_vol_in_usd
     FROM payout_calc a
-    LEFT JOIN conversion_data cd ON a.payout_currency = cd.from_currency
+    -- LEFT JOIN conversion_data cd ON a.payout_currency = cd.from_currency
     GROUP BY conversion_type, created_at, payment_method, initial_currency, converted_currency
 ),
 
