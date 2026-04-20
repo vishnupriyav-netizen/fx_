@@ -58,7 +58,7 @@ refunds_calc AS (
         ON b.payin_id = dp.payin_id
 
     WHERE a.status = 'succeeded'
-      AND toDate(a.created_at) >= toDate('2026-03-01')
+      AND toDate(a.created_at) >= toDate('2025-11-01')
       AND NOT match(dp.seller_email, '@tazapay\\.com|@digitrade\\.com')
 ),
 
