@@ -1,3 +1,6 @@
+
+
+
 -- 2. check - payout 
 
 -- FX Turnover - Payout
@@ -52,7 +55,11 @@ payout_calc AS (
         -- Destination amount derived from FX quote
         if(lower(c.`to`) = 'btc',
             ((a.amount / 100.0) * c.final_rate) / 100000000.0,
-            (a.amount / 100.0) * c.final_rate)  AS destination_amount
+            (a.amount / 100.0) * c.final_rate)  AS destination_amount,
+            CASE
+    WHEN a.currency IN ('usd', 'USD')  THEN payout_amount / 100.0
+    WHEN  a.currency IN ('btc', 'BTC') THEN (payout_amount / 100000000.0) * CAST(d.rate_in_pcy_to_usd AS Float64)
+    ELSE (payout_amount / 100.0) * CAST(d.rate_in_pcy_to_usd AS Float64) END as txn_vol_in_usd
 
     FROM datalake.clean_payout a
 
@@ -64,9 +71,12 @@ payout_calc AS (
 
     LEFT JOIN datalake.clean_fx_quote c
         ON a.destination_fx_quote_id = c.quote_id
+        
+      LEFT JOIN datamart_payout d
+        ON a.payout_id = d.payout_id
 
     WHERE a.status = 'succeeded'
-      AND toDate(a.created_at) >= toDate('2025-11-01')
+      AND toDate(a.created_at) >= toDate('2026-04-01')
       
     SETTINGS max_threads = 4, join_algorithm = 'full_sorting_merge'
 ),
