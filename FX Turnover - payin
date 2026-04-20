@@ -62,7 +62,11 @@ with money_in AS (
         -- Holding Amount (abs on LEFT JOIN NULL is intentional → treats missing as 0)
         if(lower(c.currency) = 'btc',
             abs(c.amount) / 100000000.0,
-            abs(c.amount) / 100.0)             AS holding_amount
+            abs(c.amount) / 100.0)             AS holding_amount,
+            
+CASE WHEN lower(dp.invoice_currency) = 'usd' THEN toFloat64(dp.customer_paid_amount_icy) / 100
+WHEN lower(dp.invoice_currency) = 'btc' THEN toFloat64(dp.customer_paid_amount_icy) * dp.rate_in_icy_to_usd / 100000000
+ELSE toFloat64(dp.customer_paid_amount_icy) * dp.rate_in_icy_to_usd / 100 END AS tpv_in_usd
 
     FROM datalake.clean_payment_attempt a
 
@@ -104,7 +108,7 @@ all_transactions AS (
         count(*)                                             AS number_of_transactions,  -- count(*) avoids null check
         sum(invoice_amount)                                  AS initial_amount,
         sum(charge_amount)                                   AS converted_amount,
-        sum(invoice_amount)                 AS txn_vol_in_usd
+        sum(tpv_in_usd)                 AS txn_vol_in_usd
     FROM money_in a
     -- LEFT JOIN conversion_data cd ON a.invoice_currency = cd.from_currency
     GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
@@ -122,7 +126,7 @@ all_transactions AS (
         count(*)                                             AS number_of_transactions,
         sum(invoice_amount)                                  AS initial_amount,
         sum(holding_amount)                                  AS converted_amount,
-        sum(invoice_amount)                 AS txn_vol_in_usd
+        sum(tpv_in_usd)                 AS txn_vol_in_usd
     FROM money_in a
     -- LEFT JOIN conversion_data cd ON a.invoice_currency = cd.from_currency
     GROUP BY object_type, conversion_type, created_at, payment_method, initial_currency, converted_currency
@@ -161,3 +165,6 @@ final AS (
 
 SELECT * FROM final
 SETTINGS max_threads = 4, join_algorithm = 'full_sorting_merge'  -- moved to query level (was incorrectly inside CTE)
+
+
+
