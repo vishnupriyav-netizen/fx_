@@ -39,7 +39,7 @@ adj AS (
     ) bt
         ON a.adjustment_id = bt.reference_id
 
-    WHERE a.created_at >= '2026-04-01'
+    WHERE a.created_at >= '2025-11-01'
 ),
 
 all_transactions AS (
