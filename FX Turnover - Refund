@@ -1,18 +1,16 @@
--- check 3 - refund 
+WITH
 
--- WITH
+conversion_data AS (
+    SELECT
+        `from`                              AS from_currency,
+        CAST(base_rate AS Decimal(12,10))   AS rate_in_usd,
+        ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
+    FROM datalake.clean_fx_log
+    WHERE `to` = 'USD'
+    QUALIFY row_num = 1
+),
 
--- conversion_data AS (
---     SELECT
---         `from`                              AS from_currency,
---         CAST(base_rate AS Decimal(12,10))   AS rate_in_usd,
---         ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
---     FROM datalake.clean_fx_log
---     WHERE `to` = 'USD'
---     QUALIFY row_num = 1
--- ),
-
-with refunds_calc AS (
+refunds_calc AS (
     SELECT
         toDate(a.created_at) AS created_at,
         a.refund_id,
@@ -60,7 +58,7 @@ with refunds_calc AS (
         ON b.payin_id = dp.payin_id
 
     WHERE a.status = 'succeeded'
-      AND toDate(a.created_at) >= toDate('2025-11-01')
+      AND toDate(a.created_at) >= toDate('2026-03-01')
       AND NOT match(dp.seller_email, '@tazapay\\.com|@digitrade\\.com')
 ),
 
@@ -77,11 +75,11 @@ all_transactions AS (
         count(refund_id)          AS number_of_transactions,
         sum(invoice_amount)   AS initial_amount,
         sum(holding_amount)   AS converted_amount,
-        sum(invoice_amount ) AS txn_vol_in_usd
+        sum(invoice_amount * cd.rate_in_usd) AS txn_vol_in_usd
 
     FROM refunds_calc a
-    -- LEFT JOIN conversion_data cd
-    --     ON a.invoice_currency = cd.from_currency
+    LEFT JOIN conversion_data cd
+        ON a.invoice_currency = cd.from_currency
 
     GROUP BY
 
@@ -143,92 +141,3 @@ FROM all_transactions
 
 SELECT *
 FROM final
-
-
-
-
-
--- WITH conversion_data AS (
---     SELECT
---         `from` AS from_currency,
---         CAST(base_rate AS Decimal(12,10)) AS rate_in_usd,
---         ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS rn
---     FROM datalake.clean_fx_log
---     WHERE `to` = 'USD'
---     QUALIFY rn = 1
--- )
-
--- SELECT
---     a.refund_id,
---     a.created_at,
-
---     CASE
---         WHEN lower(b.payment_method_type) LIKE '%card%'       THEN 'card'
---         WHEN lower(b.payment_method_type) LIKE '%local%'      THEN 'local_transfer'
---         WHEN lower(b.payment_method_type) LIKE '%wire%'       THEN 'wire_transfer'
---         WHEN lower(b.payment_method_type) LIKE '%stablecoin%' THEN 'stablecoin'
---         ELSE 'apm'
---     END AS payment_method,
-
---     c.invoice_currency,
---     a.holding_currency,
-
---     -- amounts used in FX calc
---     if(lower(c.invoice_currency) = 'btc',
---         a.requested_amount / 100000000.0,
---         a.requested_amount / 100.0) AS invoice_amount,
-
---     if(lower(a.holding_currency) = 'btc',
---         abs(bt.amount) / 100000000.0,
---         abs(bt.amount) / 100.0) AS holding_amount,
-
---     cd.rate_in_usd AS fx_rate_to_usd,
-
---     -- USD volume calculation
---     if(c.invoice_currency = 'USD',
---         if(lower(c.invoice_currency) = 'btc',
---             a.requested_amount / 100000000.0,
---             a.requested_amount / 100.0),
---         (if(lower(c.invoice_currency) = 'btc',
---             a.requested_amount / 100000000.0,
---             a.requested_amount / 100.0) * cd.rate_in_usd)
---     ) AS txn_volume_in_usd
-
--- FROM datalake.clean_refund a
-
--- LEFT JOIN datalake.clean_payment_attempt b
---     ON a.payment_attempt_id = b.payment_attempt_id
-
--- LEFT JOIN datalake.clean_payin c
---     ON b.payin_id = c.payin_id
-
--- LEFT JOIN (
---     SELECT
---         reference_id,
---         amount
---     FROM datalake.clean_balance_transaction
---     WHERE transaction_type = 'refund'
--- ) bt
---     ON a.refund_id = bt.reference_id
-
--- LEFT JOIN conversion_data cd
---     ON c.invoice_currency = cd.from_currency
-
--- WHERE a.status = 'succeeded'
-
--- AND a.created_at >= '2026-03-01'
--- AND a.created_at <  '2026-04-01'
-
--- AND c.invoice_currency = 'USD'
--- AND a.holding_currency = 'USD'
-
--- AND (
---     CASE
---         WHEN lower(b.payment_method_type) LIKE '%card%'       THEN 'card'
---         WHEN lower(b.payment_method_type) LIKE '%local%'      THEN 'local_transfer'
---         WHEN lower(b.payment_method_type) LIKE '%wire%'       THEN 'wire_transfer'
---         WHEN lower(b.payment_method_type) LIKE '%stablecoin%' THEN 'stablecoin'
---         ELSE 'apm'
---     END
--- ) = 'apm'
--- ;
