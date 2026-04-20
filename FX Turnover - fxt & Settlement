@@ -1,16 +1,16 @@
--- WITH
+WITH
 
--- conversion_data AS (
---     SELECT
---         `from`                              AS from_currency,
---         CAST(base_rate AS Decimal(12,10))   AS rate_in_usd,
---         ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
---     FROM datalake.clean_fx_log
---     WHERE `to` = 'USD'
---     QUALIFY row_num = 1
--- ),
+conversion_data AS (
+    SELECT
+        `from`                              AS from_currency,
+        CAST(base_rate AS Decimal(12,10))   AS rate_in_usd,
+        ROW_NUMBER() OVER (PARTITION BY `from` ORDER BY created_at DESC) AS row_num
+    FROM datalake.clean_fx_log
+    WHERE `to` = 'USD'
+    QUALIFY row_num = 1
+),
 
-with fxtrxn AS (
+fxtrxn AS (
     SELECT
         a.created_at,
         CASE
@@ -30,7 +30,7 @@ with fxtrxn AS (
             abs(to_amount) / 100.0) AS to_amount
 
     FROM datalake.clean_fx_transaction a
-    WHERE a.created_at >= '2025-11-01'
+    WHERE a.created_at >= '2026-03-01'
 ),
 
 all_transactions AS (
@@ -48,11 +48,11 @@ all_transactions AS (
         sum(from_amount) AS initial_amount,
         sum(to_amount)   AS converted_amount,
 
-        sum(from_amount) AS txn_vol_in_usd
+        sum(from_amount * cd.rate_in_usd) AS txn_vol_in_usd
 
     FROM fxtrxn a
-    -- LEFT JOIN conversion_data cd
-    --     ON a.from_currency = cd.from_currency
+    LEFT JOIN conversion_data cd
+        ON a.from_currency = cd.from_currency
 
     GROUP BY
         object_type,
@@ -113,26 +113,3 @@ FROM all_transactions
 
 SELECT *
 FROM final
-
-
-
-
-
--- SELECT
---     fx_transaction_id,
---     created_at,
---     type,
---     from_currency,
---     to_currency,
---     abs(from_amount) / 100.0 AS from_amount,
---     abs(to_amount) / 100.0   AS to_amount
--- FROM datalake.clean_fx_transaction
--- WHERE created_at >= '2026-03-01'
---   AND created_at <  '2026-04-01'
-
---   -- object_type = other_fx_txn
---   AND type = 'recovery'
-
---   -- currency pair
---   -- AND from_currency = 'PLN'
---   -- AND to_currency   = 'USD'
