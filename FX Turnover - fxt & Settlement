@@ -30,7 +30,7 @@ fxtrxn AS (
             abs(to_amount) / 100.0) AS to_amount
 
     FROM datalake.clean_fx_transaction a
-    WHERE a.created_at >= '2026-03-01'
+    WHERE a.created_at >= '2025-11-01'
 ),
 
 all_transactions AS (
