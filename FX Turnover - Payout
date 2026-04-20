@@ -76,7 +76,7 @@ payout_calc AS (
         ON a.payout_id = d.payout_id
 
     WHERE a.status = 'succeeded'
-      AND toDate(a.created_at) >= toDate('2026-04-01')
+      AND toDate(a.created_at) >= toDate('2025-11-01')
       
     SETTINGS max_threads = 4, join_algorithm = 'full_sorting_merge'
 ),
