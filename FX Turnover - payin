@@ -154,8 +154,8 @@ final AS (
         END                                               AS currency_categorisation,
         initial_currency,
         converted_currency,
-        CAST(initial_amount   AS Decimal(14, 2))          AS initial_amount,
-        CAST(converted_amount AS Decimal(14, 2))          AS converted_amount,
+        CAST(initial_amount   AS Decimal(38, 8))          AS initial_amount,
+        CAST(converted_amount AS Decimal(38, 8))          AS converted_amount,
         CASE
             WHEN initial_currency = 'USD' THEN initial_amount
             ELSE CAST(txn_vol_in_usd AS Decimal(14, 2))
