@@ -110,8 +110,8 @@ SELECT
     initial_currency,
     converted_currency,
 
-    CAST(initial_amount AS Decimal(14,2))   AS initial_amount,
-    CAST(converted_amount AS Decimal(14,2)) AS converted_amount,
+    CAST(initial_amount AS Decimal(38,8))   AS initial_amount,
+    CAST(converted_amount AS Decimal(38,8)) AS converted_amount,
 
     CASE
         WHEN initial_currency = 'USD'
